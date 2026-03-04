@@ -1,4 +1,3 @@
-
 """
 PRISM · AI-Native Data Intelligence Engine
 Single-file Streamlit deployment · v2.0
@@ -197,6 +196,45 @@ html, body, [class*="css"] {
 </style>
 """, unsafe_allow_html=True)
 
+# ── Sidebar: API key diagnostics ──────────────────────────────────────────────
+import os as _os
+
+def _check_secret(key):
+    try:
+        v = st.secrets[key]
+        if v: return f"✅ Found ({str(v)[:8]}…)"
+    except Exception:
+        pass
+    try:
+        for section in st.secrets:
+            try:
+                v = st.secrets[section][key]
+                if v: return f"✅ Found in [{section}] ({str(v)[:8]}…)"
+            except Exception:
+                pass
+    except Exception:
+        pass
+    v = _os.environ.get(key, "")
+    if v: return f"✅ Found in env ({v[:8]}…)"
+    return "❌ Not found"
+
+with st.sidebar:
+    st.markdown("### 🔑 API Key Status")
+    st.markdown(f"**GROQ_API_KEY**  \n`{_check_secret('GROQ_API_KEY')}`")
+    st.markdown(f"**ANTHROPIC_API_KEY**  \n`{_check_secret('ANTHROPIC_API_KEY')}`")
+    st.markdown("---")
+    st.markdown("""**Fix 403 — exact steps:**
+1. Streamlit Cloud → your app  
+2. ⚙ **Settings** → **Secrets**  
+3. Paste *exactly* (with quotes):
+```
+GROQ_API_KEY = "gsk_xxxxxxxxxxxx"
+```
+4. Click **Save** then **Reboot app**
+
+Free key (no card): [console.groq.com](https://console.groq.com)
+""")
+
 # ── Session state defaults ──────────────────────────────────────────────────────
 defaults = {
     "tables": {},           # {name: DataFrame}
@@ -269,64 +307,113 @@ Available tables and schema:
 
 Generate DuckDB SQL. Use table names exactly as listed above."""
 
-    # Try Groq first (fast), fallback to Anthropic
-    groq_key = st.secrets.get("GROQ_API_KEY", "")
-    anthropic_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    # ── Read API keys robustly from Streamlit secrets or env ──────────────────
+    import os, requests as _requests
+
+    def _get_secret(key: str) -> str:
+        """Try st.secrets (flat + nested), then OS env."""
+        # 1. Direct key at root level
+        try:
+            val = st.secrets[key]
+            if val:
+                return str(val).strip()
+        except Exception:
+            pass
+        # 2. Nested under any section (e.g. [general] or [api_keys])
+        try:
+            for section in st.secrets:
+                try:
+                    val = st.secrets[section][key]
+                    if val:
+                        return str(val).strip()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 3. OS environment variable
+        return os.environ.get(key, "").strip()
+
+    groq_key      = _get_secret("GROQ_API_KEY")
+    anthropic_key = _get_secret("ANTHROPIC_API_KEY")
 
     if groq_key:
-        import urllib.request
-        payload = json.dumps({
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user_msg},
-            ],
-            "temperature": 0.1,
-            "max_tokens": 800,
-        }).encode()
-        req = urllib.request.Request(
+        resp = _requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            data=payload,
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {groq_key}"},
+            headers={
+                "Content-Type":  "application/json",
+                "Authorization": f"Bearer {groq_key}",
+            },
+            json={
+                "model":       "llama-3.3-70b-versatile",
+                "messages":    [
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user_msg},
+                ],
+                "temperature": 0.1,
+                "max_tokens":  800,
+            },
+            timeout=30,
         )
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = json.loads(r.read())
-        raw = data["choices"][0]["message"]["content"].strip()
+        if resp.status_code == 401:
+            raise ValueError(
+                "Groq API key rejected (401 Unauthorized). "
+                "Check your key at console.groq.com — it should start with 'gsk_'."
+            )
+        if resp.status_code == 403:
+            raise ValueError(
+                "Groq API returned 403 Forbidden. This usually means the key is valid "
+                "but copied incorrectly (extra space or missing characters). "
+                "In Streamlit Cloud → Settings → Secrets, make sure it looks exactly like:\n"
+                "  GROQ_API_KEY = \"gsk_xxxxxxxxxxxxxxxxxxxx\"\n"
+                "Then click Save and Reboot the app."
+            )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
 
     elif anthropic_key:
-        import urllib.request
-        payload = json.dumps({
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 800,
-            "system": system,
-            "messages": [{"role": "user", "content": user_msg}],
-        }).encode()
-        req = urllib.request.Request(
+        resp = _requests.post(
             "https://api.anthropic.com/v1/messages",
-            data=payload,
             headers={
-                "Content-Type": "application/json",
-                "x-api-key": anthropic_key,
+                "Content-Type":      "application/json",
+                "x-api-key":         anthropic_key,
                 "anthropic-version": "2023-06-01",
             },
+            json={
+                "model":     "claude-sonnet-4-20250514",
+                "max_tokens": 800,
+                "system":    system,
+                "messages":  [{"role": "user", "content": user_msg}],
+            },
+            timeout=30,
         )
-        with urllib.request.urlopen(req, timeout=30) as r:
-            data = json.loads(r.read())
-        raw = data["content"][0]["text"].strip()
+        if resp.status_code in (401, 403):
+            raise ValueError(
+                f"Anthropic API key rejected ({resp.status_code}). "
+                "In Streamlit Cloud → Settings → Secrets:\n"
+                "  ANTHROPIC_API_KEY = \"sk-ant-xxxxxxxxxxxx\"\n"
+                "Then Save and Reboot."
+            )
+        resp.raise_for_status()
+        raw = resp.json()["content"][0]["text"].strip()
 
     else:
-        # Demo mode: generate simple SQL without AI
+        # Demo mode: real DuckDB execution, no AI
         table_names = list(schema.keys())
         if table_names:
             t = table_names[0]
             raw = json.dumps({
-                "sql": f"SELECT * FROM {t} LIMIT 100",
-                "confidence": 0.6,
-                "explanation": f"No API key found — showing first 100 rows of {t}. Add GROQ_API_KEY or ANTHROPIC_API_KEY in Streamlit secrets for real AI SQL generation.",
-                "warnings": ["No AI key configured — using fallback query"],
+                "sql":         f"SELECT * FROM {t} LIMIT 100",
+                "confidence":  0.5,
+                "explanation": (
+                    f"No API key detected — running real DuckDB query on {t}. "
+                    "To enable AI SQL generation: in Streamlit Cloud → ⚙ Settings → Secrets, add:\n"
+                    "  GROQ_API_KEY = \"gsk_...\"\n"
+                    "Get a free key at console.groq.com (no credit card)."
+                ),
+                "warnings": ["No API key found — using fallback SELECT. Add GROQ_API_KEY to Streamlit secrets."],
             })
         else:
-            raise ValueError("No tables loaded and no AI key configured.")
+            raise ValueError("No tables loaded. Upload a CSV or click 'Load Demo Data'.")
 
     # Strip any accidental markdown fences
     raw = re.sub(r"```json|```", "", raw).strip()
